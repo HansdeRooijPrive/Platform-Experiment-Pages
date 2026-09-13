@@ -1,0 +1,73 @@
+name: Experiment terugval (alleen leesrechten)
+
+# Test van de terugval in de nieuwe publicatiestap van OTAP-CI: zonder
+# contents: write mag de losse commit niet gemaakt worden. De stap moet dan
+# een waarschuwing geven en gewoon publiceren met de run-commit, niet falen.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+    steps:
+      - name: Site met run-nummer
+        run: |
+          mkdir -p dist
+          echo "${{ github.run_id }}" > dist/build.txt
+          echo "<!doctype html><title>Experiment</title><p>terugval run=${{ github.run_id }} sha=${{ github.sha }}</p>" > dist/index.html
+
+      - id: upload
+        uses: actions/upload-pages-artifact@v3
+        with: { path: dist }
+
+      - id: deployment
+        name: Publiceren naar Pages (zelfde script als OTAP-CI)
+        uses: actions/github-script@v7
+        env:
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact_id }}
+        with:
+          script: |
+            const owner = context.repo.owner, repo = context.repo.repo
+            let versie = context.sha
+            try {
+              const { data: basis } = await github.request('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', { owner, repo, commit_sha: context.sha })
+              const { data: los } = await github.request('POST /repos/{owner}/{repo}/git/commits', {
+                owner, repo,
+                message: `Pages-publicatie van ${context.sha} (run ${process.env.GITHUB_RUN_ID}.${process.env.GITHUB_RUN_ATTEMPT})`,
+                tree: basis.tree.sha,
+                parents: [context.sha]
+              })
+              versie = los.sha
+              core.info(`RESULTAAT publicatieversie ${versie}: losse commit met dezelfde inhoud als ${context.sha}`)
+            } catch (e) {
+              core.warning(`Geen losse commit mogelijk (HTTP ${e.status}); publiceer met ${context.sha}. Geef in de aanroepende workflow 'contents: write', anders komt een promotie naar acceptatie of productie mogelijk niet live.`)
+              core.info(`RESULTAAT terugval gebruikt na HTTP ${e.status}`)
+            }
+            const { data: dep } = await github.request('POST /repos/{owner}/{repo}/pages/deployments', {
+              owner, repo,
+              artifact_id: Number(process.env.ARTIFACT_ID),
+              pages_build_version: versie,
+              oidc_token: await core.getIDToken()
+            })
+            if (dep.page_url) core.setOutput('page_url', dep.page_url)
+            const id = dep.id || versie
+            const fout = ['deployment_failed', 'deployment_content_failed', 'deployment_cancelled', 'deployment_lost', 'deployment_perms_error', 'deployment_attempt_error']
+            for (let i = 0; i < 120; i++) {
+              const { data: st } = await github.request('GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}', { owner, repo, pages_deployment_id: id })
+              if (st.status === 'succeed') { core.info('RESULTAAT Pages-publicatie geslaagd'); return }
+              if (fout.includes(st.status)) throw new Error('Pages-publicatie mislukt: ' + st.status)
+              await new Promise(r => setTimeout(r, 5000))
+            }
+            throw new Error('Pages-publicatie niet binnen 10 minuten klaar')
